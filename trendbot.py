@@ -1,6 +1,5 @@
 import os, json, html, requests
 import xml.etree.ElementTree as ET
-from google import genai
 
 
 def load_env():
@@ -13,6 +12,12 @@ def load_env():
 
 load_env()
 UA = {"User-Agent": "Mozilla/5.0 (viral-trend-bot)"}
+
+MODELS = [
+    os.environ.get("OPENROUTER_MODEL", "openrouter/free"),
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "google/gemma-3-27b-it:free",
+]
 
 
 def google_trends():
@@ -36,37 +41,49 @@ def hacker_news():
         return []
 
 
-def reddit():
-    out = []
-    for sub in ["videos", "funny", "interestingasfuck", "sports", "technology"]:
-        try:
-            r = requests.get(f"https://www.reddit.com/r/{sub}/top.json?t=day&limit=6", headers=UA, timeout=20)
-            for p in r.json()["data"]["children"]:
-                d = p["data"]
-                out.append(f"[r/{sub}] {d['title']} ({d['score']} upvotes)")
-        except Exception as e:
-            print(f"reddit {sub} failed:", e)
-    return out
-
-
-def ask_gemini(trends):
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-    model = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
-    prompt = (
+def build_prompt(trends):
+    return (
         "You run a viral short-video news channel for TikTok, YouTube Shorts, Instagram and Facebook.\n"
         "Host style: fast, funny, friendly-sarcastic, simple English.\n"
         "From the trends below, pick the 2 best topics for short videos (high interest, safe, easy to explain).\n"
         "Skip tragedies, deaths, violence, and unverified rumors. If unsure, say \"reportedly\".\n"
         "Topic areas we like: funny/viral internet moments, tech and AI news, sports moments.\n"
-        "For each pick return JSON with: topic, why_viral, hook (max 10 words), "
+        "For each pick return JSON with these keys: topic, why_viral, hook (max 10 words), "
         "script (95-110 words, ends with a question to drive comments), caption, "
         "hashtags (list of 8), visuals (list of 4 simple scene ideas).\n"
-        "Return ONLY a JSON list of 2 objects.\n\nTRENDS:\n" + "\n".join(trends)
+        "Return ONLY a JSON list of 2 objects. No other text, no markdown.\n\nTRENDS:\n" + "\n".join(trends)
     )
-    resp = client.models.generate_content(
-        model=model, contents=prompt, config={"response_mime_type": "application/json"}
-    )
-    return json.loads(resp.text)
+
+
+def parse_json_list(text):
+    text = text.strip()
+    start, end = text.find("["), text.rfind("]")
+    if start == -1 or end == -1:
+        raise ValueError("no JSON list in reply")
+    return json.loads(text[start:end + 1])
+
+
+def ask_ai(trends):
+    key = os.environ["OPENROUTER_API_KEY"]
+    last_error = None
+    for model in MODELS:
+        try:
+            r = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {key}"},
+                json={"model": model, "messages": [{"role": "user", "content": build_prompt(trends)}]},
+                timeout=120,
+            )
+            if r.status_code != 200:
+                raise RuntimeError(f"{r.status_code} {r.text[:300]}")
+            text = r.json()["choices"][0]["message"]["content"]
+            picks = parse_json_list(text)
+            print("model used:", model)
+            return picks
+        except Exception as e:
+            last_error = e
+            print(f"model {model} failed: {e}")
+    raise SystemExit(f"all models failed, last error: {last_error}")
 
 
 def telegram(text):
@@ -87,11 +104,11 @@ def telegram(text):
 
 
 if __name__ == "__main__":
-    trends = google_trends() + hacker_news() + reddit()
+    trends = google_trends() + hacker_news()
     print(f"found {len(trends)} trends")
     if not trends:
         raise SystemExit("no trends found")
-    picks = ask_gemini(trends)
+    picks = ask_ai(trends)
     for n, p in enumerate(picks, 1):
         msg = (
             f"VIDEO IDEA {n}\n\nTopic: {p['topic']}\nWhy: {p['why_viral']}\n\n"

@@ -1,4 +1,4 @@
-import os, json, html, requests
+import os, json, html, time, requests
 import xml.etree.ElementTree as ET
 
 
@@ -28,7 +28,7 @@ def google_trends():
             tr = next((c.text for c in it if c.tag.endswith("approx_traffic")), "")
             out.append(f"[GoogleTrends] {html.unescape(it.findtext('title') or '')} ({tr} searches)")
     except Exception as e:
-        print("google trends failed:", e)
+        print("google trends failed:", type(e).__name__)
     return out[:15]
 
 
@@ -37,7 +37,7 @@ def hacker_news():
         r = requests.get("https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=10", timeout=20).json()
         return [f"[HackerNews] {h['title']} ({h.get('points', 0)} pts)" for h in r["hits"]]
     except Exception as e:
-        print("hn failed:", e)
+        print("hn failed:", type(e).__name__)
         return []
 
 
@@ -86,21 +86,41 @@ def ask_ai(trends):
     raise SystemExit(f"all models failed, last error: {last_error}")
 
 
-def telegram(text):
+def tg_call(method, retries=5, **kwargs):
+    """Call the Telegram API with retries. Never prints the token."""
     tok = os.environ["TELEGRAM_BOT_TOKEN"]
+    url = f"https://api.telegram.org/bot{tok}/{method}"
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.post(url, timeout=30, **kwargs)
+            if r.status_code == 200:
+                return r.json()
+            print(f"telegram {method} status {r.status_code}, attempt {attempt}")
+        except Exception as e:
+            print(f"telegram {method} error {type(e).__name__}, attempt {attempt}")
+        time.sleep(2 * attempt)
+    raise SystemExit(f"telegram {method} failed after {retries} tries")
+
+
+def get_chat_id():
     chat = os.environ.get("TELEGRAM_CHAT_ID")
-    if not chat:
-        u = requests.get(f"https://api.telegram.org/bot{tok}/getUpdates", timeout=20).json()
-        chat = str(u["result"][-1]["message"]["chat"]["id"])
-        with open(os.path.expanduser("~/.viral.env"), "a") as f:
-            f.write(f"\nTELEGRAM_CHAT_ID={chat}\n")
-        os.environ["TELEGRAM_CHAT_ID"] = chat
+    if chat:
+        return chat
+    u = tg_call("getUpdates")
+    if not u.get("result"):
+        raise SystemExit("No messages found. Open your bot in Telegram, press Start, send 'hi', then run again.")
+    chat = str(u["result"][-1]["message"]["chat"]["id"])
+    with open(os.path.expanduser("~/.viral.env"), "a") as f:
+        f.write(f"\nTELEGRAM_CHAT_ID={chat}\n")
+    os.environ["TELEGRAM_CHAT_ID"] = chat
+    return chat
+
+
+def telegram(text):
+    chat = get_chat_id()
     for i in range(0, len(text), 3900):
-        requests.post(
-            f"https://api.telegram.org/bot{tok}/sendMessage",
-            data={"chat_id": chat, "text": text[i:i + 3900]},
-            timeout=20,
-        )
+        tg_call("sendMessage", data={"chat_id": chat, "text": text[i:i + 3900]})
+        time.sleep(1)
 
 
 if __name__ == "__main__":
